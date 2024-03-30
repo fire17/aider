@@ -7,7 +7,7 @@ import git
 from prompt_toolkit.completion import Completion
 
 from aider import prompts, voice
-from .models_table import models
+from aider.utils import is_gpt4_with_openai_base_url, is_image_file
 
 from .dump import dump  # noqa: F401
 
@@ -26,8 +26,7 @@ class Commands:
         self.tokenizer = coder.main_model.tokenizer
 
     def is_command(self, inp):
-        if inp[0] == "/":
-            return True
+        return inp[0] in "/!"
 
     def get_commands(self):
         commands = []
@@ -68,6 +67,10 @@ class Commands:
         return matching_commands, first_word, rest_inp
 
     def run(self, inp):
+        if inp.startswith("!"):
+            return self.do_run("run", inp[1:])
+            return
+
         res = self.matching_commands(inp)
         if res is None:
             return
@@ -142,13 +145,16 @@ class Commands:
         for fname in self.coder.abs_fnames:
             relative_fname = self.coder.get_rel_fname(fname)
             content = self.io.read_text(fname)
-            # approximate
-            content = f"{relative_fname}\n```\n" + content + "```\n"
-            tokens = self.coder.main_model.token_count(content)
+            if is_image_file(relative_fname):
+                tokens = self.coder.main_model.token_count_for_image(fname)
+            else:
+                # approximate
+                content = f"{relative_fname}\n```\n" + content + "```\n"
+                tokens = self.coder.main_model.token_count(content)
             res.append((tokens, f"{relative_fname}", "use /drop to drop from chat"))
 
         current_model_name = self.coder.main_model.name
-        self.io.tool_output(f"Current model: {current_model_name}")
+        self.io.tool_output(f"Current model: {current_model_name} ({self.coder.edit_format})")
         self.io.tool_output("Approximate context window usage, in tokens:")
         self.io.tool_output()
 
@@ -173,7 +179,15 @@ class Commands:
         self.io.tool_output("=" * (width + cost_width + 1))
         self.io.tool_output(f"${total_cost:5.2f} {fmt(total)} tokens total")
 
-        limit = self.coder.main_model.max_context_tokens
+        # only switch to image model token count if gpt4 and openai and image in files
+        image_in_chat = False
+        if is_gpt4_with_openai_base_url(self.coder.main_model.name, self.coder.client):
+            image_in_chat = any(
+                is_image_file(relative_fname)
+                for relative_fname in self.coder.get_inchat_relative_files()
+            )
+        limit = 128000 if image_in_chat else self.coder.main_model.max_context_tokens
+
         remaining = limit - total
         if remaining > 1024:
             self.io.tool_output(f"{cost_pad}{fmt(remaining)} tokens remaining in context window")
@@ -192,10 +206,17 @@ class Commands:
             self.io.tool_error("No git repository found.")
             return
 
-        if self.coder.repo.is_dirty():
+        last_commit = self.coder.repo.repo.head.commit
+        changed_files_last_commit = {
+            item.a_path for item in last_commit.diff(last_commit.parents[0])
+        }
+        dirty_files = [item.a_path for item in self.coder.repo.repo.index.diff(None)]
+        dirty_files_in_last_commit = changed_files_last_commit.intersection(dirty_files)
+
+        if dirty_files_in_last_commit:
             self.io.tool_error(
-                "The repository has uncommitted changes. Please commit or stash them before"
-                " undoing."
+                "The repository has uncommitted changes in files that were modified in the last"
+                " commit. Please commit or stash them before undoing."
             )
             return
 
@@ -257,12 +278,17 @@ class Commands:
         # don't use io.tool_output() because we don't want to log or further colorize
         print(diff)
 
+    def quote_fname(self, fname):
+        if " " in fname and '"' not in fname:
+            fname = f'"{fname}"'
+        return fname
+
     def completions_add(self, partial):
         files = set(self.coder.get_all_relative_files())
         files = files - set(self.coder.get_inchat_relative_files())
         for fname in files:
             if partial.lower() in fname.lower():
-                yield Completion(fname, start_position=-len(partial))
+                yield Completion(self.quote_fname(fname), start_position=-len(partial))
 
     def glob_filtered_to_repo(self, pattern):
         try:
@@ -325,6 +351,14 @@ class Commands:
             if abs_file_path in self.coder.abs_fnames:
                 self.io.tool_error(f"{matched_file} is already in the chat")
             else:
+                if is_image_file(matched_file) and not is_gpt4_with_openai_base_url(
+                    self.coder.main_model.name, self.coder.client
+                ):
+                    self.io.tool_error(
+                        f"Cannot add image file {matched_file} as the model does not support image"
+                        " files"
+                    )
+                    continue
                 content = self.io.read_text(abs_file_path)
                 if content is None:
                     self.io.tool_error(f"Unable to read {matched_file}")
@@ -348,7 +382,7 @@ class Commands:
 
         for fname in files:
             if partial.lower() in fname.lower():
-                yield Completion(fname, start_position=-len(partial))
+                yield Completion(self.quote_fname(fname), start_position=-len(partial))
 
     def cmd_drop(self, args):
         "Remove files from the chat session to free up context space"
@@ -393,12 +427,23 @@ class Commands:
 
         self.io.tool_output(combined_output)
 
-    def cmd_run(self, args):
-        "Run a shell command and optionally add the output to the chat"
+    def cmd_test(self, args):
+        "Run a shell command and add the output to the chat on non-zero exit code"
+
+        return self.cmd_run(args, True)
+
+    def cmd_run(self, args, add_on_nonzero_exit=False):
+        "Run a shell command and optionally add the output to the chat (alias: !)"
         combined_output = None
         try:
             result = subprocess.run(
-                args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=True
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                shell=True,
+                encoding=self.io.encoding,
+                errors="replace",
             )
             combined_output = result.stdout
         except Exception as e:
@@ -409,7 +454,12 @@ class Commands:
 
         self.io.tool_output(combined_output)
 
-        if self.io.confirm_ask("Add the output to the chat?", default="y"):
+        if add_on_nonzero_exit:
+            add = result.returncode != 0
+        else:
+            add = self.io.confirm_ask("Add the output to the chat?", default="y")
+
+        if add:
             for line in combined_output.splitlines():
                 self.io.tool_output(line, log_only=True)
 
@@ -420,6 +470,10 @@ class Commands:
             return msg
 
     def cmd_exit(self, args):
+        "Exit the application"
+        sys.exit()
+
+    def cmd_quit(self, args):
         "Exit the application"
         sys.exit()
 
@@ -454,6 +508,7 @@ class Commands:
     def cmd_models(self, args):
         "Show available models and their costs"
         current_model_name = self.coder.main_model.name
+        models = self.coder.main_model.available_models()
         self.io.tool_output(f"Current model: {current_model_name}")
         self.io.tool_output("Available models:")
         # Calculate column widths
@@ -483,20 +538,19 @@ class Commands:
             # Toggle between models 3 and 4 if no alias is provided
             current_model_name = self.coder.main_model.name
             new_model_name = 'gpt-3.5-turbo-1106' if current_model_name == 'gpt-4-1106-preview' else 'gpt-4-1106-preview'
-            self.switch_model(new_model_name, output_message=True)
+            self.switch_model(new_model_name)
             return
 
+        models = self.coder.main_model.available_models()
         for model_name, model_info in models.items():
-            if model_info['Alias'] == alias:
-                self.switch_model(model_name, output_message=True)
+            if model_info['Alias'] == alias or model_info['Model'] == alias:
+                self.switch_model(model_name)
                 return
         self.io.tool_error(f"Model with alias '{alias}' not found.")
 
-    def switch_model(self, model_name, output_message=False):
+    def switch_model(self, model_name):
         # Assuming there is a method in the coder to switch models
-        self.coder.switch_model(model_name)
-        if output_message:
-            self.io.tool_output(f"Switched to model: {model_name}")
+        self.coder = self.coder.clone_with_new_model(model_name)
 
     # Alias for cmd_model
     def cmd_m(self, args):

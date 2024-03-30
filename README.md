@@ -43,7 +43,7 @@ Aider now supports a [unified diff editing format, which reduces GPT-4 Turbo's "
 To use it, run aider like this:
 
 ```
-aider --4-turbo
+aider --4turbo
 ```
 
 ## Getting started
@@ -89,6 +89,7 @@ You can find more chat transcripts on the [examples page](https://aider.chat/exa
 * You can use aider with multiple source files at once, so GPT can make coordinated code changes across all of them in a single changeset/commit.
 * Aider can [give *GPT-4* a map of your entire git repo](https://aider.chat/docs/repomap.html), which helps it understand and modify large codebases.
 * You can also edit files by hand using your editor while chatting with aider. Aider will notice these out-of-band edits and keep GPT up to date with the latest versions of your files. This lets you bounce back and forth between the aider chat and your editor, to collaboratively code with GPT.
+* If you are using gpt-4 through openai directly, you can add image files to your context which will automatically switch you to the gpt-4-vision-preview model
 
 
 ## Usage
@@ -115,8 +116,15 @@ session with the `/add` and `/drop` chat commands described below.
 If you or GPT mention one of the repo's filenames in the conversation,
 aider will ask if you'd like to add it to the chat.
 
-Aider will work best if you think about which files need to be edited to make your change and add them to the chat.
-Aider has some ability to help GPT figure out which files to edit all by itself, but the most effective approach is to explicitly add the needed files to the chat yourself.
+Think about the change you want to make and which files will need
+to be edited -- add those files to the chat.
+Don't add *all* the files in your repo to the chat.
+Be selective, and just add the files that GPT will need to edit.
+If you add a bunch of unrelated files, GPT can get overwhelmed
+and confused (and it costs more tokens).
+Aider will automatically
+share snippets from other, related files with GPT so it can
+[understand the rest of your code base](https://aider.chat/docs/repomap.html).
 
 Aider also has many
 additional command-line options, environment variables or configuration file
